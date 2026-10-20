@@ -5,5 +5,5 @@ scipy
 statsmodels
 matplotlib
 python-dotenv
-together
+together<2
 seaborn
