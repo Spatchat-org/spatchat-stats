@@ -11,6 +11,7 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import gradio as gr  # used for gr.Error and gr.update return values
+import spatchat_ui
 from dotenv import load_dotenv
 
 # LLM
@@ -731,175 +732,79 @@ def on_next(paths, idx):
 # --------------------------
 # UI (unchanged layout)
 # --------------------------
-def _logo_html() -> str:
-    import base64
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo_small.png")
-    try:
-        with open(path, "rb") as f:
-            src = "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
-    except OSError:
-        return '<span style="font-weight:700;color:#e8527a">Spatchat</span>'
-    return f'<img src="{src}" alt="Spatchat" draggable="false">'
+_WELCOME_MESSAGE = (
+    "Welcome! Upload a CSV, then ask: t-test, ANOVA (+Tukey), Kruskal (+Dunn), correlations (Pearson/Spearman), "
+    "partial/pbiserial, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Levene’s, OLS/GLM, "
+    "histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'."
+)
 
-
-_LOGO_HTML = _logo_html()
-
-# Same look as the Move room: green palette, pill header bar, dark-mode toggle.
-_THEME_HEAD = """
-<script>
-window.spatchatApplyTheme = function(theme) {
-  const dark = theme === "dark";
-  document.documentElement.classList.toggle("spatchat-dark", dark);
-  document.body.classList.toggle("spatchat-dark", dark);
-  document.body.classList.toggle("dark", dark);
-  try { localStorage.setItem("spatchat-theme", dark ? "dark" : "light"); } catch (e) {}
-};
-window.spatchatToggleTheme = function() {
-  window.spatchatApplyTheme(document.body.classList.contains("spatchat-dark") ? "light" : "dark");
-};
-(function () {
-  let saved = null;
-  try { saved = localStorage.getItem("spatchat-theme"); } catch (e) {}
-  const apply = () => window.spatchatApplyTheme(saved === "dark" ? "dark" : "light");
-  if (document.body) apply(); else document.addEventListener("DOMContentLoaded", apply, { once: true });
-})();
-</script>
-"""
+_SUGGESTION_CHIPS = [
+    "What can I do with my data?",
+    "Quick summary",
+    "Histogram",
+    "Correlations",
+    "ANOVA (+Tukey)",
+]
 
 _STATS_CSS = """
 <style>
-:root {
-  --spatchat-bg: #f5f8f5; --spatchat-surface: #ffffff; --spatchat-surface-alt: #eef3ee;
-  --spatchat-border: rgba(16, 36, 26, 0.1); --spatchat-text: #10241a; --spatchat-text-secondary: #5c6b63;
-  --spatchat-accent: #1f7a4f; --spatchat-accent-hover: #17603d; --spatchat-accent-soft: #e3f2e8;
-  --spatchat-shadow: 0 1px 3px rgba(16, 36, 26, 0.08), 0 1px 2px rgba(16, 36, 26, 0.06);
-}
-body.spatchat-dark {
-  --spatchat-bg: #0f1713; --spatchat-surface: #17211b; --spatchat-surface-alt: #1f2c24;
-  --spatchat-border: rgba(230, 240, 233, 0.12); --spatchat-text: #e6f0e9; --spatchat-text-secondary: #a3b3a9;
-  --spatchat-accent: #4fbf86; --spatchat-accent-hover: #6fd3a0; --spatchat-accent-soft: #1d3a2b;
-  --spatchat-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
-}
-html, body, gradio-app, .gradio-container, .gradio-container .main {
-  background: var(--spatchat-bg) !important; color: var(--spatchat-text) !important;
-}
-.gradio-container { max-width: 1400px !important; margin: 0 auto !important; }
-#spatchat-header-row {
-  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
-  background: var(--spatchat-surface); border: 1px solid var(--spatchat-border); box-shadow: var(--spatchat-shadow);
-  border-radius: 12px; padding: 6px 18px; margin: 4px 0 8px;
-}
-#spatchat-header-row img { height: 32px; margin: 6px 0; border-radius: 6px; display: block; }
-body.spatchat-dark #spatchat-header-row img { background: #fff; border-radius: 8px; padding: 2px 6px; }
-#spatchat-header-row nav { display: flex; gap: 22px; align-items: center; font-size: 15px; font-weight: 600; }
-#spatchat-header-row nav a { color: var(--spatchat-text); text-decoration: none; }
-#spatchat-header-row nav a:hover, #spatchat-header-row nav a.accent { color: var(--spatchat-accent); }
-.spatchat-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 8px 0 14px; }
-.spatchat-title { margin: 0; font-size: 26px; font-weight: 700; color: var(--spatchat-text); }
-.spatchat-subtitle { margin: 4px 0 0; font-size: 14px; color: var(--spatchat-text-secondary); }
-.spatchat-title-actions { display: flex; gap: 8px; align-items: center; }
-.spatchat-title-actions button {
-  padding: 8px 16px; font-size: 13px; font-weight: 600; border-radius: 8px; cursor: pointer;
-  border: 1px solid var(--spatchat-border); background: transparent; color: var(--spatchat-text-secondary);
-}
-.spatchat-title-actions button:hover { background: var(--spatchat-surface-alt); color: var(--spatchat-text); }
-.spatchat-title-actions #spatchat-share-btn { border-color: var(--spatchat-accent); color: var(--spatchat-accent); }
-.spatchat-theme-dark { display: none; }
-body.spatchat-dark .spatchat-theme-light { display: none; }
-body.spatchat-dark .spatchat-theme-dark { display: inline; }
-.spatchat-footer { font-size: 12px; color: var(--spatchat-text-secondary); margin-top: 18px; }
-.gradio-container .block, .gradio-container .form { background: var(--spatchat-surface) !important; border-color: var(--spatchat-border) !important; border-radius: 12px !important; }
-.gradio-container button.primary, .gradio-container .primary { background: var(--spatchat-accent) !important; border-color: var(--spatchat-accent) !important; color: #fff !important; }
-.gradio-container button.secondary { background: var(--spatchat-surface-alt) !important; color: var(--spatchat-text) !important; border: 1px solid var(--spatchat-border) !important; }
-.gradio-container button.secondary:hover { background: var(--spatchat-accent-soft) !important; }
-.gradio-container textarea, .gradio-container input[type=text] { background: var(--spatchat-surface) !important; color: var(--spatchat-text) !important; }
 .dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid var(--spatchat-border); border-radius: 6px; padding: 6px; }
-#preview-plot { margin-bottom: 6px; }
+#preview-plot { margin-bottom: 6px; width: 100% !important; min-height: 380px; }
+#plot-nav { width: 100%; }
+#spatchat-plots-pane > .column, #spatchat-data-pane > .column { width: 100% !important; flex: 1 1 100% !important; }
+#plot-nav button { min-width: 120px; white-space: nowrap; }
 #plot-nav { margin: 0 0 10px 0; display: flex; gap: 8px; justify-content: flex-end; }
+#plot-nav button { background: var(--spatchat-surface-alt) !important; color: var(--spatchat-text) !important; border: 1px solid var(--spatchat-border) !important; border-radius: 10px !important; }
+#plot-nav button:hover { background: var(--spatchat-accent-soft) !important; }
 </style>
 """
 
-_STATS_HEADER = """
-<div id="spatchat-header-row">
-  <div>""" + _LOGO_HTML + """</div>
-  <nav>
-    <a href="https://spatchat.org/" target="_blank" rel="noopener">Home</a>
-    <a href="https://spatchat.org/about" target="_blank" rel="noopener">About</a>
-    <a href="https://spatchat.org/browse" target="_blank" rel="noopener" class="accent">Browse Rooms</a>
-    <a href="https://spatchat.org/join" target="_blank" rel="noopener">Join</a>
-  </nav>
-</div>
-<div class="spatchat-title-row">
-  <div>
-    <h1 class="spatchat-title">Stats Room</h1>
-    <p class="spatchat-subtitle">General statistics, data exploration, and plots through conversation.</p>
-  </div>
-  <div class="spatchat-title-actions">
-    <button id="spatchat-theme-btn" type="button" onclick="window.spatchatToggleTheme && window.spatchatToggleTheme()">
-      <span class="spatchat-theme-light">Dark mode</span><span class="spatchat-theme-dark">Light mode</span>
-    </button>
-    <button id="spatchat-share-btn" type="button" onclick="
-      navigator.clipboard.writeText('https://spatchat.org/browse/?room=stats');
-      this.textContent = 'Link copied';
-      setTimeout(() => { this.textContent = 'Share'; }, 1500);
-    ">Share</button>
-  </div>
-</div>
-"""
 
-_STATS_FOOTER = """
-<div class="spatchat-footer">
-© 2025 Ho Yi Wan &amp; Logan Hysen. All rights reserved. If you use SpatChat in research, please cite:
-<b>Wan, H.Y.</b> &amp; <b>Hysen, L.</b> (2025). <i>SpatChat: Stats Room.</i>
-</div>
-"""
+with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
+    spatchat_ui.build_header(
+        gr,
+        "Stats Room",
+        "General statistics, data exploration, and plots through conversation.",
+        "stats",
+    )
+    gr.HTML(_STATS_CSS)
 
+    with gr.Row(elem_id="spatchat-workarea"):
+        with gr.Column(scale=3, min_width=0, elem_id="spatchat-sidebar"):
+            chatbot = gr.Chatbot(**spatchat_ui.chatbot_kwargs(gr, _WELCOME_MESSAGE))
+            spatchat_ui.chip_row(gr, _SUGGESTION_CHIPS)
+            file_input, user_input, send_btn = spatchat_ui.composer(gr, "Message Spatchat...", [".csv"])
+            download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False, elem_id="spatchat-download")
 
-with gr.Blocks(title="SpatChat: Stats Room", head=_THEME_HEAD) as demo:
-    gr.HTML(_STATS_CSS + _STATS_HEADER)
-
-    with gr.Row():
-        with gr.Column(scale=2):
-            chatbot = gr.Chatbot(
-                label="SpatChat",
-                show_label=True,
-                type="messages",
-                value=[
-                    {
-                        "role": "assistant",
-                        "content": "Welcome! Upload a CSV, then ask: t-test, ANOVA (+Tukey), Kruskal (+Dunn), correlations (Pearson/Spearman), partial/pbiserial, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'.",
-                    }
-                ],
-            )
-            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., Tukey HSD score by group", lines=1)
-            file_input = gr.File(label="Upload CSV", file_types=[".csv"])
-
-        with gr.Column(scale=3):
-            preview_plot = gr.Image(label="Preview (last figure)", value=None, type="filepath", elem_id="preview-plot")
-            with gr.Row(elem_id="plot-nav"):
-                prev_btn = gr.Button("◀️ Prev", variant="secondary")
-                next_btn = gr.Button("Next ▶️", variant="secondary")
-            data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
-            download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
+        with gr.Column(scale=5, min_width=0, elem_id="spatchat-mapcol"):
+            with gr.Tabs(elem_id="spatchat-tabs"):
+                with gr.Tab("Plots", id="plots", elem_id="spatchat-plots-pane"):
+                    preview_plot = gr.Image(label="Preview (last figure)", value=None, type="filepath", elem_id="preview-plot")
+                    with gr.Row(elem_id="plot-nav"):
+                        prev_btn = gr.Button("◀️ Prev", variant="secondary")
+                        next_btn = gr.Button("Next ▶️", variant="secondary")
+                with gr.Tab("Data", id="data", elem_id="spatchat-data-pane"):
+                    data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
             gallery_paths = gr.State([])
             gallery_index = gr.State(-1)
 
-    gr.HTML(_STATS_FOOTER)
+    spatchat_ui.build_footer(gr, "Wan, H.Y. &amp; Hysen, L. (2025). <i>SpatChat: Stats Room.</i>")
 
     demo.queue(max_size=16)
 
-    file_input.change(
+    file_input.upload(
         handle_upload,
         inputs=file_input,
         outputs=[chatbot, data_preview, download_btn],
     )
 
-    user_input.submit(
-        metered_chat(room="stats", message_index=1, deny=_chat_denied)(handle_chat),
+    gr.on(
+        triggers=[user_input.submit, send_btn.click],
+        fn=metered_chat(room="stats", message_index=1, deny=_chat_denied)(handle_chat),
         inputs=[chatbot, user_input, data_preview],
         outputs=[chatbot, preview_plot, download_btn, data_preview, gallery_paths, gallery_index],
     )
-    user_input.submit(lambda *args: "", inputs=None, outputs=user_input)
+    gr.on(triggers=[user_input.submit, send_btn.click], fn=lambda *args: "", inputs=None, outputs=user_input)
 
     def on_prev(paths, idx):
         preview, new_idx = _step(paths, idx, -1)
