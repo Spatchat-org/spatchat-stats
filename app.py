@@ -207,6 +207,9 @@ def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
 # =========================
 # Data & chat handlers (used by UI)
 # =========================
+_SAMPLE_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data", "demo_stats.csv")
+
+
 def handle_upload(file):
     """
     UI wires: file_input.change(handle_upload, ...)
@@ -234,7 +237,7 @@ def handle_upload(file):
                 }
             ],
             gr.update(value=preview, visible=True),
-            gr.update(visible=True),
+            gr.update(visible=False),  # nothing to download until an analysis has run
         )
     except Exception as e:
         return (
@@ -250,6 +253,60 @@ def _chat_denied(markdown, chat_history, user_message, data_preview):
         {"role": "assistant", "content": markdown},
     ]
     return history, gr.skip(), gr.skip(), data_preview, gr.skip(), gr.skip()
+
+
+_GROUP_ACTIONS = {"ttest", "anova", "posthoc_tukey", "kruskal", "posthoc_dunn", "levene", "mwutest", "pbiserial"}
+
+
+def _fill_default_columns(df: pd.DataFrame, action: Optional[str], args: Dict) -> Optional[str]:
+    """Fill value/group (or plot columns) the user left out. Returns a note describing what was chosen."""
+    nums, groups = need_value_and_group(df)
+    if not nums:
+        return None
+    nums = [str(c) for c in nums]
+    groups = [str(g) for g in groups if str(g) not in nums]
+    prefer_value = next((c for c in nums if c.lower() in {"score", "value", "outcome", "y"}), nums[-1])
+
+    def pick_group(levels=None):
+        ok = [g for g in groups if levels is None or df[g].nunique(dropna=True) == levels]
+        if levels == 3:
+            ok = [g for g in groups if df[g].nunique(dropna=True) >= 3]
+        return (ok or groups or [None])[0]
+
+    chosen = []
+    if action in _GROUP_ACTIONS:
+        if not args.get("value"):
+            args["value"] = prefer_value; chosen.append(f"outcome **{prefer_value}**")
+        if not args.get("group"):
+            levels = 2 if action in {"ttest", "mwutest", "pbiserial"} else 3 if action in {"anova", "posthoc_tukey", "kruskal", "posthoc_dunn"} else None
+            g = pick_group(levels)
+            if g:
+                args["group"] = g; chosen.append(f"group **{g}**")
+    elif action == "plot":
+        if isinstance(args.get("hist"), dict) and not args["hist"].get("col"):
+            args["hist"]["col"] = prefer_value; chosen.append(f"column **{prefer_value}**")
+        for kind in ("box", "violin", "bar"):
+            spec = args.get(kind)
+            if isinstance(spec, dict):
+                if not spec.get("value"):
+                    spec["value"] = prefer_value; chosen.append(f"outcome **{prefer_value}**")
+                if not spec.get("group"):
+                    g = pick_group()
+                    if g:
+                        spec["group"] = g; chosen.append(f"group **{g}**")
+    elif action == "check":
+        spec = args.get("normality")
+        if isinstance(spec, dict) and not spec.get("col"):
+            spec["col"] = prefer_value; chosen.append(f"column **{prefer_value}**")
+    elif action == "corr" and not args.get("matrix") and not (args.get("x") and args.get("y")):
+        args["matrix"] = True; args["cols"] = []
+        chosen.append("all numeric columns")
+    elif action == "wilcoxon" and not (args.get("a") and args.get("b")) and len(nums) >= 2:
+        args["a"], args["b"] = nums[0], nums[1]; chosen.append(f"**{nums[0]}** vs **{nums[1]}**")
+    elif action == "chisq" and not (args.get("row") and args.get("col")) and len(groups) >= 2:
+        args["row"], args["col"] = groups[0], groups[1]; chosen.append(f"**{groups[0]}** by **{groups[1]}**")
+    return ("Using " + ", ".join(chosen) + " (say which columns you want to change it).") if chosen else None
+
 
 
 def handle_chat(chat_history, user_message, data_preview):
@@ -317,6 +374,9 @@ def handle_chat(chat_history, user_message, data_preview):
         return _resolve_colname(df, name)
     def _rg_many(names: Optional[List[str]]) -> List[str]:
         return _resolve_many(df, names)
+
+    # Chips and short requests ("Histogram", "ANOVA") omit columns: pick sensible defaults and say so.
+    defaults_note = _fill_default_columns(df, action, args)
 
     sections: List[Tuple[str, str, Optional[np.ndarray]]] = []
     image_paths: List[str] = []
@@ -711,6 +771,8 @@ def handle_chat(chat_history, user_message, data_preview):
         return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
 
     # Finalize report & zip, prep gallery preview
+    if defaults_note and chat_history and chat_history[-1].get("role") == "assistant":
+        chat_history[-1] = {**chat_history[-1], "content": f"{chat_history[-1]['content']}\n\n_{defaults_note}_"}
     write_report(sections)
     zip_fp = save_zip()
     preview, paths, idx = _safe_last(image_paths)
@@ -749,7 +811,8 @@ _SUGGESTION_CHIPS = [
 _STATS_CSS = """
 <style>
 .dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid var(--spatchat-border); border-radius: 6px; padding: 6px; }
-#preview-plot { margin-bottom: 6px; width: 100% !important; min-height: 380px; }
+#preview-plot { margin-bottom: 6px; width: 100% !important; height: 46vh !important; min-height: 280px; max-height: 460px; }
+#preview-plot img { object-fit: contain !important; max-height: 100% !important; }
 #plot-nav { width: 100%; }
 #spatchat-plots-pane > .column, #spatchat-data-pane > .column { width: 100% !important; flex: 1 1 100% !important; }
 #plot-nav button { min-width: 120px; white-space: nowrap; }
@@ -772,7 +835,7 @@ with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
     with gr.Row(elem_id="spatchat-workarea"):
         with gr.Column(scale=3, min_width=0, elem_id="spatchat-sidebar"):
             chatbot = gr.Chatbot(**spatchat_ui.chatbot_kwargs(gr, _WELCOME_MESSAGE))
-            spatchat_ui.chip_row(gr, _SUGGESTION_CHIPS)
+            sample_btn = spatchat_ui.chip_row_with_sample(gr, _SUGGESTION_CHIPS)
             file_input, user_input, send_btn = spatchat_ui.composer(gr, "Message Spatchat...", [".csv"])
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False, elem_id="spatchat-download")
 
@@ -795,6 +858,11 @@ with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
     file_input.upload(
         handle_upload,
         inputs=file_input,
+        outputs=[chatbot, data_preview, download_btn],
+    )
+    sample_btn.click(
+        lambda: handle_upload(_SAMPLE_DATA_PATH),
+        inputs=None,
         outputs=[chatbot, data_preview, download_btn],
     )
 
