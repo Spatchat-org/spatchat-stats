@@ -6,12 +6,16 @@
 import os
 import re
 import json
+import shutil
+import uuid
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import gradio as gr  # used for gr.Error and gr.update return values
 import spatchat_ui
+import spatchat_files as sfiles
+from gradio.context import LocalContext
 from dotenv import load_dotenv
 
 # LLM
@@ -85,14 +89,49 @@ from stats import (
 print("Starting SpatChat: Stats Room (chat-first)")
 
 # =========================
-# Globals
+# Per-visitor state: one entry per browser tab, with its own sessions/<id>/{uploads,outputs} folders
+# (removed when the tab closes). Nothing a visitor uploads or produces is visible to anyone else.
 # =========================
-cached_df: Optional[pd.DataFrame] = None
-outputs_dir = "outputs"
-os.makedirs(outputs_dir, exist_ok=True)
+SESSIONS_ROOT = "sessions"
+shutil.rmtree(SESSIONS_ROOT, ignore_errors=True)  # leftovers of a previous process belong to nobody
+os.makedirs(SESSIONS_ROOT, exist_ok=True)
+_SESSIONS: Dict[str, dict] = {}
+_HASH_TO_SID: Dict[str, str] = {}
 
-# Track if we asked a follow-up
-pending: Dict[str, Optional[str]] = {"action": None, "need": None, "args": None}
+
+def _request_hash() -> Optional[str]:
+    try:
+        request = LocalContext.request.get()
+    except LookupError:
+        return None
+    return str(getattr(request, "session_hash", "") or "") or None
+
+
+def _session(sid: Optional[str]) -> Tuple[str, dict]:
+    """(session id, state) for this visitor, created on first use."""
+    sid = (sid or "").strip() or uuid.uuid4().hex
+    S = _SESSIONS.get(sid)
+    if S is None:
+        S = {"df": None, "active": None, "pending": {"action": None, "need": None, "args": None}}
+        _SESSIONS[sid] = S
+    S["root"] = os.path.join(SESSIONS_ROOT, sid)
+    S["upload_dir"] = os.path.join(S["root"], "uploads")
+    S["output_dir"] = os.path.join(S["root"], "outputs")
+    os.makedirs(S["upload_dir"], exist_ok=True)
+    os.makedirs(S["output_dir"], exist_ok=True)
+    rh = _request_hash()
+    if rh:
+        _HASH_TO_SID[rh] = sid
+    return sid, S
+
+
+def _cleanup_browser_session() -> None:
+    rh = _request_hash()
+    sid = _HASH_TO_SID.pop(rh, None) if rh else None
+    if sid:
+        _SESSIONS.pop(sid, None)
+        shutil.rmtree(os.path.join(SESSIONS_ROOT, sid), ignore_errors=True)
+
 
 # =========================
 # LLM init & styling
@@ -210,49 +249,59 @@ def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
 _SAMPLE_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data", "demo_stats.csv")
 
 
-def handle_upload(file):
-    """
-    UI wires: file_input.change(handle_upload, ...)
-    Returns: (chat_history, data_preview_component, download_btn_component)
-    """
-    global cached_df
-    clear_outputs()
-    pending.update({"action": None, "need": None, "args": None})
+def _read_csv(path: str) -> pd.DataFrame:
     try:
-        df = pd.read_csv(file)
-        cached_df = df
-        cols = ", ".join(map(str, df.columns))
-        preview = df.head(200)
-        return (
-            [
-                {
-                    "role": "assistant",
-                    "content": (
-                        "CSV uploaded. Columns detected: "
-                        f"{cols}. Ask me for t-test, ANOVA (+ Tukey), Kruskal (+ Dunn), "
-                        "correlations/partial/pbiserial, chi-square/Fisher, rank tests, Levene’s, "
-                        "OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, "
-                        "or 'what can I do with my data?'"
-                    ),
-                }
-            ],
-            gr.update(value=preview, visible=True),
-            gr.update(visible=False),  # nothing to download until an analysis has run
-        )
+        return pd.read_csv(path)
+    except Exception:
+        return pd.read_csv(path, sep=None, engine="python", encoding="latin-1")
+
+
+def _activate(S: dict, path: Optional[str]) -> None:
+    """Make `path` the dataset the analyses run on (or none)."""
+    S["pending"].update({"action": None, "need": None, "args": None})
+    if path and os.path.isfile(path):
+        S["df"], S["active"] = _read_csv(path), path
+    else:
+        S["df"], S["active"] = None, None
+
+
+def handle_upload(file, sid, chat_history):
+    """Copy an uploaded CSV into this visitor's folder and make it the active dataset.
+    Returns (chat_history, download_btn, session id)."""
+    sid, S = _session(sid)
+    chat = list(chat_history or [])
+    src = getattr(file, "name", file)
+    try:
+        name = os.path.basename(str(src))
+        stem, ext = os.path.splitext(name)
+        dst, n = os.path.join(S["upload_dir"], name), 2
+        while os.path.exists(dst):
+            dst = os.path.join(S["upload_dir"], f"{stem}_{n}{ext}")
+            n += 1
+        shutil.copy2(src, dst)
+        _activate(S, dst)
+        cols = ", ".join(map(str, S["df"].columns))
+        chat.append({"role": "assistant", "content": (
+            f"Loaded **{os.path.basename(dst)}**. Columns detected: {cols}. "
+            "Ask me for t-test, ANOVA (+ Tukey), Kruskal (+ Dunn), "
+            "correlations/partial/pbiserial, chi-square/Fisher, rank tests, Levene’s, "
+            "OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, "
+            "or 'what can I do with my data?'")})
     except Exception as e:
-        return (
-            [{"role": "assistant", "content": f"Failed to read CSV: {e}"}],
-            gr.update(visible=False),
-            gr.update(visible=False),
-        )
+        try:
+            os.remove(dst)  # do not keep a file we could not read
+        except Exception:
+            pass
+        chat.append({"role": "assistant", "content": f"Failed to read CSV: {e}"})
+    return chat, gr.update(), sid
 
 
-def _chat_denied(markdown, chat_history, user_message, data_preview):
+def _chat_denied(markdown, chat_history, user_message, sid):
     history = list(chat_history or []) + [
         {"role": "user", "content": str(user_message or "")},
         {"role": "assistant", "content": markdown},
     ]
-    return history, gr.skip(), gr.skip(), data_preview, gr.skip(), gr.skip()
+    return history, gr.skip(), sid
 
 
 _GROUP_ACTIONS = {"ttest", "anova", "posthoc_tukey", "kruskal", "posthoc_dunn", "levene", "mwutest", "pbiserial"}
@@ -309,14 +358,16 @@ def _fill_default_columns(df: pd.DataFrame, action: Optional[str], args: Dict) -
 
 
 
-def handle_chat(chat_history, user_message, data_preview):
+def _handle_chat_core(chat_history, user_message, S):
     """
     Core router for user requests. The UI passes (chat_history, user_input, data_preview)
     and expects:
       (chat_history, preview_plot_component, download_btn_component,
        data_preview, gallery_paths_state, gallery_index_state)
     """
-    global cached_df, pending
+    od = S["output_dir"]
+    pending = S["pending"]
+    data_preview = None
     chat_history = list(chat_history)
     text = str(user_message or "").strip()
 
@@ -337,10 +388,10 @@ def handle_chat(chat_history, user_message, data_preview):
             llm_error_text = f"(LLM unavailable: {e})"
 
     if pending["action"] and parsed and parsed.get("tool") == "stats":
-        pending = {"action": None, "need": None, "args": None}
+        pending.update({"action": None, "need": None, "args": None})
 
     if not parsed or parsed.get("tool") != "stats":
-        msg = clarify_message(cached_df, llm_error_text, text)
+        msg = clarify_message(S["df"], llm_error_text, text)
         chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
         preview, paths, idx = _safe_last([])
         return (
@@ -352,7 +403,7 @@ def handle_chat(chat_history, user_message, data_preview):
             idx,
         )
 
-    if cached_df is None:
+    if S["df"] is None:
         msg = "Please upload a CSV first."
         chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
         preview, paths, idx = _safe_last([])
@@ -367,7 +418,7 @@ def handle_chat(chat_history, user_message, data_preview):
 
     action = parsed.get("action")
     args = sanitize_args(action, parsed.get("args", {}))
-    df = cached_df.copy()
+    df = S["df"].copy()
 
     # --- central resolution for all arg column names ---
     def _rg(name: Optional[str]) -> Optional[str]:
@@ -388,8 +439,8 @@ def handle_chat(chat_history, user_message, data_preview):
             msg = "Recommendations\n" + tech + "\n\nSay it like this\n" + examples
             sections.append(("Recommendations", msg, None))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
-            write_report(sections)
-            zip_fp = save_zip()
+            write_report(sections, od)
+            zip_fp = save_zip(od)
             preview, paths, idx = _safe_last([])
             return (chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx)
 
@@ -403,8 +454,8 @@ def handle_chat(chat_history, user_message, data_preview):
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
-            write_report(sections)
-            zip_fp = save_zip()
+            write_report(sections, od)
+            zip_fp = save_zip(od)
             preview, paths, idx = _safe_last([])
             return (chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx)
 
@@ -428,7 +479,7 @@ def handle_chat(chat_history, user_message, data_preview):
             )
             sections.append(("t-test", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"ttest_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"ttest_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- ANOVA --------
@@ -446,7 +497,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = run_anova(df, value=value, group=group)
             sections.append(("ANOVA", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"anova_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"anova_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- POSTHOC: TUKEY --------
@@ -463,7 +514,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = tukey_hsd(df, value=value, group=group)
             sections.append(("Post-hoc: Tukey HSD", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"tukey_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"tukey_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- KRUSKAL --------
@@ -480,7 +531,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = kruskal_wallis(df, value=value, group=group)
             sections.append(("Kruskal–Wallis", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"kruskal_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"kruskal_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- POSTHOC: DUNN --------
@@ -511,7 +562,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = chisq_test(df, row=row, col=col, exact=exact)
             sections.append(("Chi-square / Fisher", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"chisq_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"chisq_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- CORRELATION(S) --------
@@ -522,7 +573,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 txt, imgs = corr_matrix_plot(df, cols=cols, method=method)
                 sections.append(("Correlation matrix", txt, None))
                 for i, im in enumerate(imgs):
-                    image_paths.append(save_image_np(im, f"corr_matrix_{method}_{i+1}.png"))
+                    image_paths.append(save_image_np(im, f"corr_matrix_{method}_{i+1}.png", od))
                 chat_history.extend(
                     [{"role": "user", "content": text}, {"role": "assistant", "content": "Correlation matrix generated."}]
                 )
@@ -538,7 +589,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 txt, imgs = corr_pair(df, x=x, y=y, method=method)
                 sections.append(("Correlation", txt, None))
                 for i, im in enumerate(imgs):
-                    image_paths.append(save_image_np(im, f"corr_pair_{method}_{i+1}.png"))
+                    image_paths.append(save_image_np(im, f"corr_pair_{method}_{i+1}.png", od))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- PARTIAL CORRELATION --------
@@ -554,7 +605,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = partial_corr(df, x=x, y=y, controls=ctrls, method=method)
             sections.append(("Partial correlation", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"pcorr_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"pcorr_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- POINT-BISERIAL --------
@@ -572,7 +623,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = point_biserial(df, value=value, group=group)
             sections.append(("Point-biserial correlation", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"pbiserial_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"pbiserial_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- MANN–WHITNEY --------
@@ -589,7 +640,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = mann_whitney(df, value=value, group=group)
             sections.append(("Mann–Whitney U", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"mwutest_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"mwutest_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- WILCOXON SIGNED-RANK --------
@@ -605,7 +656,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = wilcoxon_signed(df, a=a, b=b)
             sections.append(("Wilcoxon signed-rank", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"wilcoxon_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"wilcoxon_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- LEVENE --------
@@ -636,7 +687,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = run_ols(df, formula=formula)
             sections.append(("OLS", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"ols_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"ols_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- GLM --------
@@ -652,7 +703,7 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = run_glm(df, formula=formula, family=family)
             sections.append((f"GLM ({family})", txt, None))
             for i, im in enumerate(imgs):
-                image_paths.append(save_image_np(im, f"glm_plot_{i+1}.png"))
+                image_paths.append(save_image_np(im, f"glm_plot_{i+1}.png", od))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- PLOTS --------
@@ -662,7 +713,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 p = args["hist"]
                 col = _rg(p.get("col"))
                 title, im = plot_hist(df, col, int(p.get("bins", 30)))
-                image_paths.append(save_image_np(im, f"plot_hist_{str(col)}.png"))
+                image_paths.append(save_image_np(im, f"plot_hist_{str(col)}.png", od))
                 sections.append((title, "", im))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
 
@@ -678,7 +729,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 if val == grp:
                     raise gr.Error("Outcome and group must be different.")
                 title, im = plot_box(df, val, grp)
-                image_paths.append(save_image_np(im, f"plot_box_{str(val)}_{str(grp)}.png"))
+                image_paths.append(save_image_np(im, f"plot_box_{str(val)}_{str(grp)}.png", od))
                 sections.append((title, "", im))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
 
@@ -694,7 +745,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 if val == grp:
                     raise gr.Error("Outcome and group must be different.")
                 title, im = plot_violin(df, val, grp)
-                image_paths.append(save_image_np(im, f"plot_violin_{str(val)}_{str(grp)}.png"))
+                image_paths.append(save_image_np(im, f"plot_violin_{str(val)}_{str(grp)}.png", od))
                 sections.append((title, "", im))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
 
@@ -713,7 +764,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 # Use stable ordering inferred by helper
                 gorder = df[grp].dropna().astype(str).unique().tolist()
                 im = bar_with_error_plot(df, val, grp, error=err, gorder=gorder)
-                image_paths.append(save_image_np(im, f"plot_bar_{str(val)}_{str(grp)}_{err}.png"))
+                image_paths.append(save_image_np(im, f"plot_bar_{str(val)}_{str(grp)}_{err}.png", od))
                 sections.append((f"Bar {str(val)}~{str(grp)}", "", im))
                 chat_history.extend(
                     [{"role": "user", "content": text}, {"role": "assistant", "content": f"Bar ± {str(err).upper()} generated."}]
@@ -725,7 +776,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 p = args["normality"]
                 col = _rg(p.get("col"))
                 msg, im = check_normality(df, col)
-                image_paths.append(save_image_np(im, f"plot_qq_{str(col)}.png"))
+                image_paths.append(save_image_np(im, f"plot_qq_{str(col)}.png", od))
                 sections.append(("Normality", msg, im))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
 
@@ -773,27 +824,102 @@ def handle_chat(chat_history, user_message, data_preview):
     # Finalize report & zip, prep gallery preview
     if defaults_note and chat_history and chat_history[-1].get("role") == "assistant":
         chat_history[-1] = {**chat_history[-1], "content": f"{chat_history[-1]['content']}\n\n_{defaults_note}_"}
-    write_report(sections)
-    zip_fp = save_zip()
+    write_report(sections, od)
+    zip_fp = save_zip(od)
     preview, paths, idx = _safe_last(image_paths)
     return (chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx)
 
 
 # =========================
-# Optional: gallery nav helpers the UI may bind to buttons
+# What the Plots and Files tabs show
 # =========================
-def on_prev(paths, idx):
-    preview, new_idx = _step(paths, idx, -1)
-    return gr.update(value=preview), new_idx
+_EMPTY_PLOTS_HTML = spatchat_ui.empty_state_html(
+    "plot", "Drop a CSV here, or click + to start",
+    "Or click &ldquo;Try sample data&rdquo;. Then ask for a histogram, box plot, t-test or any analysis. "
+    "Every figure stays here so you can compare them.",
+)
+_SAMPLE_PATH = _SAMPLE_DATA_PATH
 
 
-def on_next(paths, idx):
-    preview, new_idx = _step(paths, idx, +1)
-    return gr.update(value=preview), new_idx
+def _entries(S: dict):
+    """(uploaded, produced) file entries for the Files tab."""
+    active = os.path.abspath(S.get("active") or "")
 
-# --------------------------
-# UI (unchanged layout)
-# --------------------------
+    def up_note(path):
+        return "Dataset" + (" (active)" if os.path.abspath(path) == active else "")
+
+    def out_note(path):
+        ext = os.path.splitext(path)[1].lower()
+        return {".png": "Plot", ".html": "Report", ".zip": "Results bundle", ".csv": "Table"}.get(ext, "")
+
+    return (sfiles.scan(S["upload_dir"], sfiles.UPLOADED, note_for=up_note),
+            sfiles.scan(S["output_dir"], sfiles.PRODUCED, note_for=out_note))
+
+
+def _views(sid, open_active=False):
+    """Plots gallery + Files tab, from what is on disk. `open_active` opens the dataset as a datasheet."""
+    sid, S = _session(sid)
+    gal, gal_empty = spatchat_ui.gallery_updates(gr, spatchat_ui.list_images(S["output_dir"]), _EMPTY_PLOTS_HTML)
+    uploaded, produced = _entries(S)
+    return (gal, gal_empty,
+            *files_panel.updates(gr, uploaded, produced, preview_path=S.get("active") if open_active else None))
+
+
+def _views_open(sid):
+    return _views(sid, open_active=True)
+
+
+def _download_for(S: dict):
+    """Show the results zip when there is something to download."""
+    if sfiles.scan(S["output_dir"], sfiles.PRODUCED, exts=(".png", ".html", ".csv")):
+        return gr.update(value=save_zip(S["output_dir"]), visible=True)
+    return gr.update(value=None, visible=False)
+
+
+def on_upload(file, chat_history, sid):
+    chat, _, sid = handle_upload(file, sid, chat_history)
+    return chat, sid
+
+
+def on_sample(chat_history, sid):
+    return on_upload(_SAMPLE_PATH, chat_history, sid)
+
+
+def chat_step(chat_history, user_message, sid):
+    sid, S = _session(sid)
+    out = _handle_chat_core(chat_history, user_message, S)
+    return out[0], out[2], sid
+
+
+def files_remove(rows, paths, chat_history, sid):
+    """Delete the ticked files; if the active dataset goes, fall back to the newest one left (or none)."""
+    sid, S = _session(sid)
+    removed, problems = sfiles.remove_paths(files_panel.ticked(rows, paths), [S["root"]])
+    gone = {os.path.abspath(p) for p in removed}
+    chat = list(chat_history or [])
+    note = ""
+    if S.get("active") and os.path.abspath(S["active"]) in gone:
+        left = sfiles.scan(S["upload_dir"], sfiles.UPLOADED)
+        _activate(S, left[0]["path"] if left else None)
+        note = (f" Now using **{os.path.basename(S['active'])}**." if S.get("active") else " No dataset is loaded now.")
+    if gone:
+        chat.append({"role": "assistant", "content": sfiles.removal_message(removed) + "." + note})
+        if any(p.startswith(os.path.abspath(S["output_dir"])) for p in gone):
+            _download = _download_for(S)  # keep the zip in step with what is left
+        else:
+            _download = gr.skip()
+    else:
+        _download = gr.skip()
+    return (*files_panel.updates(gr, *_entries(S), message=sfiles.removal_message(removed), problems=problems,
+                                 reset_preview=bool(removed)),
+            chat, _download, sid)
+
+
+def files_download(rows, paths, sid):
+    sid, S = _session(sid)
+    return files_panel.download_update(gr, rows, paths, [S["root"]])
+
+
 _WELCOME_MESSAGE = (
     "Welcome! Upload a CSV, then ask: t-test, ANOVA (+Tukey), Kruskal (+Dunn), correlations (Pearson/Spearman), "
     "partial/pbiserial, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Levene’s, OLS/GLM, "
@@ -810,42 +936,17 @@ _SUGGESTION_CHIPS = [
 
 _STATS_CSS = """
 <style>
-.dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid var(--spatchat-border); border-radius: 6px; padding: 6px; }
 #preview-plot { width: 100% !important; height: auto !important; max-height: none !important; }
 #preview-plot .grid-wrap, #preview-plot .grid-container { height: auto !important; max-height: none !important; overflow: visible !important; }
 #preview-plot .thumbnail-item { aspect-ratio: 1 / 1 !important; height: auto !important; }
 #preview-plot .thumbnail-item img { object-fit: contain !important; }
 #spatchat-plots-pane { overflow-y: auto !important; }
-#spatchat-plots-pane > .column, #spatchat-data-pane > .column { width: 100% !important; flex: 1 1 100% !important; }
+#spatchat-plots-pane > .column { width: 100% !important; flex: 1 1 100% !important; }
 </style>
 """
 
 
-_EMPTY_PLOTS_HTML = spatchat_ui.empty_state_html(
-    "plot", "Drop a CSV here, or click + to start",
-    "Or click &ldquo;Try sample data&rdquo;. Then ask for a histogram, box plot, t-test or any analysis. "
-    "Every figure stays here so you can compare them.",
-)
-
-
-def chat_with_gallery(chat_history, user_message, data_preview, prev_paths):
-    """handle_chat, but figures accumulate (newest first) instead of replacing the single preview."""
-    chat, _preview, download, data, new_paths, idx = handle_chat(chat_history, user_message, data_preview)
-    merged = list(new_paths or []) + [p for p in (prev_paths or []) if p not in (new_paths or [])]
-    merged = [p for p in merged if p and os.path.exists(p)]
-    gallery = gr.update(value=merged) if merged else gr.skip()
-    return chat, gallery, download, data, merged, (0 if merged else -1), gr.update(value="" if merged else _EMPTY_PLOTS_HTML)
-
-
-def _chat_denied_with_gallery(markdown, chat_history, user_message, data_preview, prev_paths):
-    history = list(chat_history or []) + [
-        {"role": "user", "content": str(user_message or "")},
-        {"role": "assistant", "content": markdown},
-    ]
-    return history, gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
-
-
-with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
+with gr.Blocks(title="SpatChat: Stats Room") as demo:
     spatchat_ui.build_header(
         gr,
         "Stats Room",
@@ -868,30 +969,38 @@ with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
                     # Every figure from this session, newest first; click one to enlarge it.
                     preview_plot = gr.Gallery(label="Figures", show_label=False, value=None, columns=3, height=None,
                                               object_fit="contain", allow_preview=True, elem_id="preview-plot")
-                with gr.Tab("Data", id="data", elem_id="spatchat-data-pane"):
-                    data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
-            gallery_paths = gr.State([])
-            gallery_index = gr.State(-1)
+                files_panel = sfiles.build(gr)
+            session_state = gr.State(None)
 
     spatchat_ui.build_footer(gr, "Wan, H.Y. &amp; Hysen, L. (2025). <i>SpatChat: Stats Room.</i>")
 
     demo.queue(max_size=16)
+    demo.unload(_cleanup_browser_session)
 
-    def _upload_and_reset(file):
-        # A new dataset starts a fresh set of figures.
-        return (*handle_upload(file), gr.update(value=None), gr.update(value=_EMPTY_PLOTS_HTML), [], -1)
+    VIEW_OUTPUTS = [preview_plot, plots_empty, *files_panel.outputs]
 
-    upload_outputs = [chatbot, data_preview, download_btn, preview_plot, plots_empty, gallery_paths, gallery_index]
-    file_input.upload(_upload_and_reset, inputs=file_input, outputs=upload_outputs)
-    sample_btn.click(lambda: _upload_and_reset(_SAMPLE_DATA_PATH), inputs=None, outputs=upload_outputs)
+    file_input.upload(on_upload, inputs=[file_input, chatbot, session_state], outputs=[chatbot, session_state]
+    ).then(_views_open, inputs=session_state, outputs=VIEW_OUTPUTS)
+    sample_btn.click(on_sample, inputs=[chatbot, session_state], outputs=[chatbot, session_state]
+    ).then(_views_open, inputs=session_state, outputs=VIEW_OUTPUTS)
+
+    files_panel.refresh_btn.click(_views, inputs=session_state, outputs=VIEW_OUTPUTS)
+    files_panel.remove_btn.click(
+        files_remove,
+        inputs=[*files_panel.selections, chatbot, session_state],
+        outputs=[*files_panel.outputs, chatbot, download_btn, session_state],
+    ).then(_views, inputs=session_state, outputs=VIEW_OUTPUTS, show_progress="hidden")
+    files_panel.table.input(files_download, inputs=[*files_panel.selections, session_state],
+                            outputs=files_panel.download_btn, show_progress="hidden")
 
     gr.on(
         triggers=[user_input.submit, send_btn.click],
-        fn=metered_chat(room="stats", message_index=1, deny=_chat_denied_with_gallery)(chat_with_gallery),
-        inputs=[chatbot, user_input, data_preview, gallery_paths],
-        outputs=[chatbot, preview_plot, download_btn, data_preview, gallery_paths, gallery_index, plots_empty],
-    )
+        fn=metered_chat(room="stats", message_index=1, deny=_chat_denied)(chat_step),
+        inputs=[chatbot, user_input, session_state],
+        outputs=[chatbot, download_btn, session_state],
+    ).then(_views, inputs=session_state, outputs=VIEW_OUTPUTS, show_progress="hidden")
     gr.on(triggers=[user_input.submit, send_btn.click], fn=lambda *args: "", inputs=None, outputs=user_input)
 
+
 if __name__ == "__main__":
-    demo.launch(ssr_mode=False)
+    demo.launch(ssr_mode=False, head=spatchat_ui.HEAD)

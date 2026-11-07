@@ -13,7 +13,7 @@ os.makedirs(outputs_dir, exist_ok=True)
 def add_to_report(parts: List[str], title: str, html_fragment: str):
     parts.append(f"<h2>{title}</h2>{html_fragment}")
 
-def write_report(sections: List[Tuple[str, str, Optional[np.ndarray]]]) -> str:
+def write_report(sections: List[Tuple[str, str, Optional[np.ndarray]]], outputs_dir: str = outputs_dir) -> str:
     """
     sections: list of (title, preformatted_text, optional_image_np)
     Writes an HTML report to outputs/stats_report.html and returns its filepath.
@@ -30,21 +30,23 @@ def write_report(sections: List[Tuple[str, str, Optional[np.ndarray]]]) -> str:
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
             parts.append(f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto' />")
     html = "\n".join(parts).encode("utf-8")
+    os.makedirs(outputs_dir, exist_ok=True)
     fp = os.path.join(outputs_dir, "stats_report.html")
     with open(fp, "wb") as f:
         f.write(html)
     return fp
 
-def save_image_np(arr: np.ndarray, fname: str) -> str:
+def save_image_np(arr: np.ndarray, fname: str, outputs_dir: str = outputs_dir) -> str:
     """
     Save a numpy RGB image array to outputs/<fname> (PNG) and return the filepath.
     """
     from PIL import Image
+    os.makedirs(outputs_dir, exist_ok=True)
     fp = os.path.join(outputs_dir, fname)
     Image.fromarray(arr).save(fp, format="PNG")
     return fp
 
-def save_zip() -> str:
+def save_zip(outputs_dir: str = outputs_dir) -> str:
     """
     Zips everything currently in outputs/ (excluding the zip itself) to
     outputs/spatchat_stats_results.zip and returns the archive path.
@@ -61,7 +63,7 @@ def save_zip() -> str:
                 z.write(full, arcname=fn)
     return archive
 
-def clear_outputs():
+def clear_outputs(outputs_dir: str = outputs_dir):
     """
     Clears and recreates outputs/ directory.
     """
