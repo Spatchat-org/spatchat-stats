@@ -15,6 +15,7 @@ import pandas as pd
 import gradio as gr  # used for gr.Error and gr.update return values
 import spatchat_ui
 import spatchat_files as sfiles
+import spatchat_layout
 from gradio.context import LocalContext
 from dotenv import load_dotenv
 
@@ -145,6 +146,18 @@ set_house_style()  # apply house plotting theme once
 # =========================
 # Small helpers (incl. robust column resolution)
 # =========================
+def _message_text(message) -> str:
+    """Plain text of a chat message. Gradio 6 delivers content as a list of blocks, Gradio 5 as a string."""
+    content = message.get("content") if isinstance(message, dict) else message
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "\n".join(
+            _message_text(part.get("text") if isinstance(part, dict) and "text" in part else part)
+            for part in content if part)
+    return "" if content is None else str(content)
+
+
 def _fence(text: str) -> str:
     """Wrap multi-line stats text to prevent Markdown table parsing in the chat UI."""
     from textwrap import dedent
@@ -823,7 +836,7 @@ def _handle_chat_core(chat_history, user_message, S):
 
     # Finalize report & zip, prep gallery preview
     if defaults_note and chat_history and chat_history[-1].get("role") == "assistant":
-        chat_history[-1] = {**chat_history[-1], "content": f"{chat_history[-1]['content']}\n\n_{defaults_note}_"}
+        chat_history[-1] = {**chat_history[-1], "content": f"{_message_text(chat_history[-1])}\n\n_{defaults_note}_"}
     write_report(sections, od)
     zip_fp = save_zip(od)
     preview, paths, idx = _safe_last(image_paths)
@@ -834,8 +847,8 @@ def _handle_chat_core(chat_history, user_message, S):
 # What the Plots and Files tabs show
 # =========================
 _EMPTY_PLOTS_HTML = spatchat_ui.empty_state_html(
-    "plot", "Drop a CSV here, or click + to start",
-    "Or click &ldquo;Try sample data&rdquo;. Then ask for a histogram, box plot, t-test or any analysis. "
+    "plot", "No plots yet",
+    "Load a CSV, then ask for a histogram, box plot, t-test or any analysis. "
     "Every figure stays here so you can compare them.",
 )
 _SAMPLE_PATH = _SAMPLE_DATA_PATH
@@ -857,6 +870,26 @@ def _entries(S: dict):
     sfiles.stamp_sources(produced, os.path.join(S["root"], ".provenance.json"),
                          os.path.basename(S["active"]) if S.get("active") else "")
     return uploaded, produced
+
+
+def _map_html(S: dict) -> str:
+    """Map tab: the active dataset's points when it has coordinates, otherwise the standard empty map."""
+    df = S.get("df")
+    if df is None:
+        return spatchat_layout.empty_map(
+            "Drop a CSV here, or click + to start",
+            "Data with latitude and longitude columns appears on this map; any other data is analysed in the Plots tab.")
+    xy = spatchat_layout.detect_lonlat(df)
+    if xy is None:
+        return spatchat_layout.empty_map(
+            "No coordinates in this dataset",
+            "Add latitude and longitude columns to see it on the map. Every analysis still works without them.")
+    return spatchat_layout.points_map(df, xy[0], xy[1],
+                                      label=os.path.basename(S["active"]) if S.get("active") else "Points")
+
+
+def map_for(sid):
+    return _map_html(_session(sid)[1])
 
 
 def _views(sid, open_active=False):
@@ -926,7 +959,8 @@ def files_download(rows, paths, sid):
 _WELCOME_MESSAGE = (
     "Welcome! Upload a CSV, then ask: t-test, ANOVA (+Tukey), Kruskal (+Dunn), correlations (Pearson/Spearman), "
     "partial/pbiserial, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Levene’s, OLS/GLM, "
-    "histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'."
+    "histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'. "
+    "If your data has latitude and longitude columns it also shows on the map."
 )
 
 _SUGGESTION_CHIPS = [
@@ -937,45 +971,25 @@ _SUGGESTION_CHIPS = [
     "ANOVA (+Tukey)",
 ]
 
-_STATS_CSS = """
-<style>
-#preview-plot { width: 100% !important; height: auto !important; max-height: none !important; }
-#preview-plot .grid-wrap, #preview-plot .grid-container { height: auto !important; max-height: none !important; overflow: visible !important; }
-#preview-plot .thumbnail-item { aspect-ratio: 1 / 1 !important; height: auto !important; }
-#preview-plot .thumbnail-item img { object-fit: contain !important; }
-#spatchat-plots-pane { overflow-y: auto !important; }
-#spatchat-plots-pane > .column { width: 100% !important; flex: 1 1 100% !important; }
-</style>
-"""
-
 
 with gr.Blocks(title="SpatChat: Stats Room") as demo:
-    spatchat_ui.build_header(
+    ui = spatchat_layout.build(
         gr,
-        "Stats Room",
-        "General statistics, data exploration, and plots through conversation.",
-        "stats",
+        title="Stats Room",
+        subtitle="General statistics, data exploration, and plots through conversation.",
+        room="stats",
+        cite="Wan, H.Y. &amp; Hysen, L. (2025). <i>SpatChat: Stats Room.</i>",
+        welcome=_WELCOME_MESSAGE,
+        chips=_SUGGESTION_CHIPS,
+        placeholder="Message Spatchat...",
+        file_types=[".csv"],
+        map_html=_map_html({}),
+        plots_empty_html=_EMPTY_PLOTS_HTML,
     )
-    gr.HTML(_STATS_CSS)
-
-    with gr.Row(elem_id="spatchat-workarea"):
-        with gr.Column(scale=3, min_width=0, elem_id="spatchat-sidebar"):
-            chatbot = gr.Chatbot(**spatchat_ui.chatbot_kwargs(gr, _WELCOME_MESSAGE))
-            sample_btn = spatchat_ui.chip_row_with_sample(gr, _SUGGESTION_CHIPS)
-            file_input, user_input, send_btn = spatchat_ui.composer(gr, "Message Spatchat...", [".csv"])
-            download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False, elem_id="spatchat-download")
-
-        with gr.Column(scale=5, min_width=0, elem_id="spatchat-mapcol"):
-            with gr.Tabs(elem_id="spatchat-tabs"):
-                with gr.Tab("Plots", id="plots", elem_id="spatchat-plots-pane"):
-                    plots_empty = gr.HTML(value=_EMPTY_PLOTS_HTML, visible=True)
-                    # Every figure from this session, newest first; click one to enlarge it.
-                    preview_plot = gr.Gallery(label="Figures", show_label=False, value=None, columns=3, height=None,
-                                              object_fit="contain", allow_preview=True, elem_id="preview-plot")
-                files_panel = sfiles.build(gr)
-            session_state = gr.State(None)
-
-    spatchat_ui.build_footer(gr, "Wan, H.Y. &amp; Hysen, L. (2025). <i>SpatChat: Stats Room.</i>")
+    chatbot, sample_btn, file_input = ui.chatbot, ui.sample_btn, ui.file_input
+    user_input, send_btn, download_btn = ui.user_input, ui.send_btn, ui.download_btn
+    preview_plot, plots_empty, files_panel = ui.gallery, ui.gallery_empty, ui.files
+    session_state, map_out = ui.session_state, ui.map_out
 
     demo.queue(max_size=16)
     demo.unload(_cleanup_browser_session)
@@ -983,16 +997,19 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
     VIEW_OUTPUTS = [preview_plot, plots_empty, *files_panel.outputs]
 
     file_input.upload(on_upload, inputs=[file_input, chatbot, session_state], outputs=[chatbot, session_state]
-    ).then(_views_open, inputs=session_state, outputs=VIEW_OUTPUTS)
+    ).then(_views_open, inputs=session_state, outputs=VIEW_OUTPUTS
+    ).then(map_for, inputs=session_state, outputs=map_out)
     sample_btn.click(on_sample, inputs=[chatbot, session_state], outputs=[chatbot, session_state]
-    ).then(_views_open, inputs=session_state, outputs=VIEW_OUTPUTS)
+    ).then(_views_open, inputs=session_state, outputs=VIEW_OUTPUTS
+    ).then(map_for, inputs=session_state, outputs=map_out)
 
     files_panel.refresh_btn.click(_views, inputs=session_state, outputs=VIEW_OUTPUTS)
     files_panel.remove_btn.click(
         files_remove,
         inputs=[*files_panel.selections, chatbot, session_state],
         outputs=[*files_panel.outputs, chatbot, download_btn, session_state],
-    ).then(_views, inputs=session_state, outputs=VIEW_OUTPUTS, show_progress="hidden")
+    ).then(_views, inputs=session_state, outputs=VIEW_OUTPUTS, show_progress="hidden"
+    ).then(map_for, inputs=session_state, outputs=map_out)
     files_panel.table.input(files_download, inputs=[*files_panel.selections, session_state],
                             outputs=files_panel.download_btn, show_progress="hidden")
 
