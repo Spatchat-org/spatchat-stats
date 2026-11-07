@@ -852,8 +852,11 @@ def _entries(S: dict):
         ext = os.path.splitext(path)[1].lower()
         return {".png": "Plot", ".html": "Report", ".zip": "Results bundle", ".csv": "Table"}.get(ext, "")
 
-    return (sfiles.scan(S["upload_dir"], sfiles.UPLOADED, note_for=up_note),
-            sfiles.scan(S["output_dir"], sfiles.PRODUCED, note_for=out_note))
+    uploaded = sfiles.scan(S["upload_dir"], sfiles.UPLOADED, note_for=up_note)
+    produced = sfiles.scan(S["output_dir"], sfiles.PRODUCED, note_for=out_note)
+    sfiles.stamp_sources(produced, os.path.join(S["root"], ".provenance.json"),
+                         os.path.basename(S["active"]) if S.get("active") else "")
+    return uploaded, produced
 
 
 def _views(sid, open_active=False):
