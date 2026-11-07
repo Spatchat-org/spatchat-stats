@@ -837,6 +837,7 @@ with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
             chatbot = gr.Chatbot(**spatchat_ui.chatbot_kwargs(gr, _WELCOME_MESSAGE))
             sample_btn = spatchat_ui.chip_row_with_sample(gr, _SUGGESTION_CHIPS)
             file_input, user_input, send_btn = spatchat_ui.composer(gr, "Message Spatchat...", [".csv"])
+            spatchat_ui.drop_hint(gr, "a CSV file")
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False, elem_id="spatchat-download")
 
         with gr.Column(scale=5, min_width=0, elem_id="spatchat-mapcol"):
