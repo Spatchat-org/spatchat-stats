@@ -811,16 +811,34 @@ _SUGGESTION_CHIPS = [
 _STATS_CSS = """
 <style>
 .dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid var(--spatchat-border); border-radius: 6px; padding: 6px; }
-#preview-plot { margin-bottom: 6px; width: 100% !important; height: 46vh !important; min-height: 280px; max-height: 460px; }
-#preview-plot img { object-fit: contain !important; max-height: 100% !important; }
-#plot-nav { width: 100%; }
+#preview-plot { width: 100% !important; }
 #spatchat-plots-pane > .column, #spatchat-data-pane > .column { width: 100% !important; flex: 1 1 100% !important; }
-#plot-nav button { min-width: 120px; white-space: nowrap; }
-#plot-nav { margin: 0 0 10px 0; display: flex; gap: 8px; justify-content: flex-end; }
-#plot-nav button { background: var(--spatchat-surface-alt) !important; color: var(--spatchat-text) !important; border: 1px solid var(--spatchat-border) !important; border-radius: 10px !important; }
-#plot-nav button:hover { background: var(--spatchat-accent-soft) !important; }
 </style>
 """
+
+
+_EMPTY_PLOTS_HTML = spatchat_ui.empty_state_html(
+    "plot", "No plots yet",
+    "Load a CSV (or click &ldquo;Try sample data&rdquo;) and ask for a histogram, box plot, t-test or any analysis. "
+    "Every figure stays here so you can compare them.",
+)
+
+
+def chat_with_gallery(chat_history, user_message, data_preview, prev_paths):
+    """handle_chat, but figures accumulate (newest first) instead of replacing the single preview."""
+    chat, _preview, download, data, new_paths, idx = handle_chat(chat_history, user_message, data_preview)
+    merged = list(new_paths or []) + [p for p in (prev_paths or []) if p not in (new_paths or [])]
+    merged = [p for p in merged if p and os.path.exists(p)]
+    gallery = gr.update(value=merged) if merged else gr.skip()
+    return chat, gallery, download, data, merged, (0 if merged else -1), gr.update(value="" if merged else _EMPTY_PLOTS_HTML)
+
+
+def _chat_denied_with_gallery(markdown, chat_history, user_message, data_preview, prev_paths):
+    history = list(chat_history or []) + [
+        {"role": "user", "content": str(user_message or "")},
+        {"role": "assistant", "content": markdown},
+    ]
+    return history, gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
 
 with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
@@ -843,10 +861,10 @@ with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
         with gr.Column(scale=5, min_width=0, elem_id="spatchat-mapcol"):
             with gr.Tabs(elem_id="spatchat-tabs"):
                 with gr.Tab("Plots", id="plots", elem_id="spatchat-plots-pane"):
-                    preview_plot = gr.Image(label="Preview (last figure)", value=None, type="filepath", elem_id="preview-plot")
-                    with gr.Row(elem_id="plot-nav"):
-                        prev_btn = gr.Button("◀️ Prev", variant="secondary")
-                        next_btn = gr.Button("Next ▶️", variant="secondary")
+                    plots_empty = gr.HTML(value=_EMPTY_PLOTS_HTML, visible=True)
+                    # Every figure from this session, newest first; click one to enlarge it.
+                    preview_plot = gr.Gallery(label="Figures", show_label=False, value=None, columns=2, height=560,
+                                              object_fit="contain", allow_preview=True, elem_id="preview-plot")
                 with gr.Tab("Data", id="data", elem_id="spatchat-data-pane"):
                     data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
             gallery_paths = gr.State([])
@@ -856,36 +874,21 @@ with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
 
     demo.queue(max_size=16)
 
-    file_input.upload(
-        handle_upload,
-        inputs=file_input,
-        outputs=[chatbot, data_preview, download_btn],
-    )
-    sample_btn.click(
-        lambda: handle_upload(_SAMPLE_DATA_PATH),
-        inputs=None,
-        outputs=[chatbot, data_preview, download_btn],
-    )
+    def _upload_and_reset(file):
+        # A new dataset starts a fresh set of figures.
+        return (*handle_upload(file), gr.update(value=None), gr.update(value=_EMPTY_PLOTS_HTML), [], -1)
+
+    upload_outputs = [chatbot, data_preview, download_btn, preview_plot, plots_empty, gallery_paths, gallery_index]
+    file_input.upload(_upload_and_reset, inputs=file_input, outputs=upload_outputs)
+    sample_btn.click(lambda: _upload_and_reset(_SAMPLE_DATA_PATH), inputs=None, outputs=upload_outputs)
 
     gr.on(
         triggers=[user_input.submit, send_btn.click],
-        fn=metered_chat(room="stats", message_index=1, deny=_chat_denied)(handle_chat),
-        inputs=[chatbot, user_input, data_preview],
-        outputs=[chatbot, preview_plot, download_btn, data_preview, gallery_paths, gallery_index],
+        fn=metered_chat(room="stats", message_index=1, deny=_chat_denied_with_gallery)(chat_with_gallery),
+        inputs=[chatbot, user_input, data_preview, gallery_paths],
+        outputs=[chatbot, preview_plot, download_btn, data_preview, gallery_paths, gallery_index, plots_empty],
     )
     gr.on(triggers=[user_input.submit, send_btn.click], fn=lambda *args: "", inputs=None, outputs=user_input)
-
-    def on_prev(paths, idx):
-        preview, new_idx = _step(paths, idx, -1)
-        return gr.update(value=preview), new_idx
-
-    def on_next(paths, idx):
-        preview, new_idx = _step(paths, idx, +1)
-        return gr.update(value=preview), new_idx
-
-    prev_btn.click(on_prev, inputs=[gallery_paths, gallery_index], outputs=[preview_plot, gallery_index])
-    next_btn.click(on_next, inputs=[gallery_paths, gallery_index], outputs=[preview_plot, gallery_index])
-
 
 if __name__ == "__main__":
     demo.launch(ssr_mode=False)
