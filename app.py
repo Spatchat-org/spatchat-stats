@@ -818,8 +818,8 @@ _STATS_CSS = """
 
 
 _EMPTY_PLOTS_HTML = spatchat_ui.empty_state_html(
-    "plot", "No plots yet",
-    "Load a CSV (or click &ldquo;Try sample data&rdquo;) and ask for a histogram, box plot, t-test or any analysis. "
+    "plot", "Drop a CSV here, or click + to start",
+    "Or click &ldquo;Try sample data&rdquo;. Then ask for a histogram, box plot, t-test or any analysis. "
     "Every figure stays here so you can compare them.",
 )
 
@@ -855,7 +855,6 @@ with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
             chatbot = gr.Chatbot(**spatchat_ui.chatbot_kwargs(gr, _WELCOME_MESSAGE))
             sample_btn = spatchat_ui.chip_row_with_sample(gr, _SUGGESTION_CHIPS)
             file_input, user_input, send_btn = spatchat_ui.composer(gr, "Message Spatchat...", [".csv"])
-            spatchat_ui.drop_hint(gr, "a CSV file")
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False, elem_id="spatchat-download")
 
         with gr.Column(scale=5, min_width=0, elem_id="spatchat-mapcol"):
