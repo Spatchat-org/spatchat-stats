@@ -811,7 +811,11 @@ _SUGGESTION_CHIPS = [
 _STATS_CSS = """
 <style>
 .dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid var(--spatchat-border); border-radius: 6px; padding: 6px; }
-#preview-plot { width: 100% !important; }
+#preview-plot { width: 100% !important; height: auto !important; max-height: none !important; }
+#preview-plot .grid-wrap, #preview-plot .grid-container { height: auto !important; max-height: none !important; overflow: visible !important; }
+#preview-plot .thumbnail-item { aspect-ratio: 1 / 1 !important; height: auto !important; }
+#preview-plot .thumbnail-item img { object-fit: contain !important; }
+#spatchat-plots-pane { overflow-y: auto !important; }
 #spatchat-plots-pane > .column, #spatchat-data-pane > .column { width: 100% !important; flex: 1 1 100% !important; }
 </style>
 """
@@ -862,7 +866,7 @@ with gr.Blocks(title="SpatChat: Stats Room", head=spatchat_ui.HEAD) as demo:
                 with gr.Tab("Plots", id="plots", elem_id="spatchat-plots-pane"):
                     plots_empty = gr.HTML(value=_EMPTY_PLOTS_HTML, visible=True)
                     # Every figure from this session, newest first; click one to enlarge it.
-                    preview_plot = gr.Gallery(label="Figures", show_label=False, value=None, columns=2, height=560,
+                    preview_plot = gr.Gallery(label="Figures", show_label=False, value=None, columns=3, height=None,
                                               object_fit="contain", allow_preview=True, elem_id="preview-plot")
                 with gr.Tab("Data", id="data", elem_id="spatchat-data-pane"):
                     data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
