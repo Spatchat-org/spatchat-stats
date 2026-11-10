@@ -102,7 +102,7 @@ class _SpacedCallLimiter:
 # Unified LLM Client
 # --------------------------
 HF_MODEL_DEFAULT = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-TOGETHER_MODEL_DEFAULT = "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"
+TOGETHER_MODEL_DEFAULT = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 
 class UnifiedLLM:
     def __init__(self):
