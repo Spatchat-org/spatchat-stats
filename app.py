@@ -7,6 +7,8 @@ import os
 import re
 import json
 import shutil
+import threading
+import time
 import uuid
 from typing import List, Dict, Optional, Tuple
 
@@ -98,6 +100,8 @@ shutil.rmtree(SESSIONS_ROOT, ignore_errors=True)  # leftovers of a previous proc
 os.makedirs(SESSIONS_ROOT, exist_ok=True)
 _SESSIONS: Dict[str, dict] = {}
 _HASH_TO_SID: Dict[str, str] = {}
+_LAST_SEEN: Dict[str, float] = {}
+_UNLOAD_GRACE_SECONDS = 15 * 60
 
 
 def _request_hash() -> Optional[str]:
@@ -110,7 +114,13 @@ def _request_hash() -> Optional[str]:
 
 def _session(sid: Optional[str]) -> Tuple[str, dict]:
     """(session id, state) for this visitor, created on first use."""
-    sid = (sid or "").strip() or uuid.uuid4().hex
+    sid = (sid or "").strip()
+    if not sid:
+        # an event that arrives before the new session id reached the browser joins the session this connection has
+        rh = _request_hash()
+        sid = _HASH_TO_SID.get(rh, "") if rh else ""
+    sid = sid or uuid.uuid4().hex
+    _LAST_SEEN[sid] = time.time()
     S = _SESSIONS.get(sid)
     if S is None:
         S = {"df": None, "active": None, "pending": {"action": None, "need": None, "args": None}}
@@ -126,12 +136,22 @@ def _session(sid: Optional[str]) -> Tuple[str, dict]:
     return sid, S
 
 
+def _cleanup_if_still_idle(sid: str, closed_at: float) -> None:
+    if _LAST_SEEN.get(sid, 0.0) > closed_at:
+        return  # the visitor came back: the "close" was a dropped connection
+    _SESSIONS.pop(sid, None)
+    shutil.rmtree(os.path.join(SESSIONS_ROOT, sid), ignore_errors=True)
+
+
 def _cleanup_browser_session() -> None:
+    """Gradio says a tab closed. Behind proxies a dropped keep-alive looks the same, so only delete the data if
+    nothing touches the session for a while."""
     rh = _request_hash()
     sid = _HASH_TO_SID.pop(rh, None) if rh else None
     if sid:
-        _SESSIONS.pop(sid, None)
-        shutil.rmtree(os.path.join(SESSIONS_ROOT, sid), ignore_errors=True)
+        timer = threading.Timer(_UNLOAD_GRACE_SECONDS, _cleanup_if_still_idle, args=(sid, time.time()))
+        timer.daemon = True
+        timer.start()
 
 
 # =========================
