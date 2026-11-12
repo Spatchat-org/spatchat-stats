@@ -4,6 +4,23 @@
 # Imports
 # =========================
 import os
+# Structured logging: the shared module comes from the gateway (skipped when this room runs on its own).
+try:
+    import spatchat_log
+
+    spatchat_log.setup("stats")
+except Exception:
+    pass
+
+import logging
+
+try:
+    from spatchat_log import swallowed as _swallowed
+except Exception:  # shared module not available: still record the problem with plain logging
+
+    def _swallowed(where, level=logging.WARNING):
+        logging.getLogger("spatchat.swallowed").log(level, "ignored error in %s", where, exc_info=True)
+
 import re
 import json
 import shutil
@@ -324,7 +341,7 @@ def handle_upload(file, sid, chat_history):
         try:
             os.remove(dst)  # do not keep a file we could not read
         except Exception:
-            pass
+            _swallowed("stats.app:handle_upload (remove)")
         chat.append({"role": "assistant", "content": f"Failed to read CSV: {e}"})
     return chat, gr.update(), sid
 
