@@ -209,6 +209,8 @@ def ask_llm(
         call = json.loads(resp)
         return call, resp
     except Exception:
+        if isinstance(resp, str) and resp.strip():
+            return None, resp
         conv = llm.chat(
             messages=[{"role": "system", "content": fallback_prompt}] + messages,
             temperature=0.7,
